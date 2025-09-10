@@ -60,7 +60,11 @@ const App: React.FC = () => {
     const dragStartElementPositions = useRef<Map<string, {x: number, y: number} | Point[]>>(new Map());
     const elementsRef = useRef(elements); // Ref to have latest elements inside closures
     const svgRef = useRef<SVGSVGElement>(null);
-    elementsRef.current = elements;
+    
+    // 确保elementsRef与当前elements状态同步
+    useEffect(() => {
+        elementsRef.current = elements;
+    }, [elements]);
 
     const setElements = (updater: (prev: Element[]) => Element[], commit: boolean = true) => {
         const newElements = updater(elementsRef.current);
