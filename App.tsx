@@ -29,6 +29,24 @@ const getElementBounds = (element: Element): { x: number; y: number; width: numb
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
+// 计算图片自适应尺寸的函数
+const calculateAdaptiveImageSize = (originalWidth: number, originalHeight: number, maxCanvasWidth: number = 800, maxCanvasHeight: number = 600) => {
+    // 如果图片尺寸已经合适，直接返回
+    if (originalWidth <= maxCanvasWidth && originalHeight <= maxCanvasHeight) {
+        return { width: originalWidth, height: originalHeight };
+    }
+    
+    // 计算缩放比例，保持宽高比
+    const scaleX = maxCanvasWidth / originalWidth;
+    const scaleY = maxCanvasHeight / originalHeight;
+    const scale = Math.min(scaleX, scaleY);
+    
+    return {
+        width: Math.round(originalWidth * scale),
+        height: Math.round(originalHeight * scale)
+    };
+}
+
 type Rect = { x: number; y: number; width: number; height: number };
 type Guide = { type: 'v' | 'h'; position: number; start: number; end: number };
 const SNAP_THRESHOLD = 5; // pixels in screen space
@@ -310,18 +328,40 @@ const App: React.FC = () => {
                 newHeight = minSize;
             }
             
-            // 如果按住Shift键，保持宽高比
-            if (shiftKey) {
+            // 对于图片元素，始终保持宽高比；对于其他元素，只有按住Shift键时才保持宽高比
+            if (originalElement.type === 'image' || shiftKey) {
                 const aspectRatio = originalElement.width / originalElement.height;
+                
+                // 根据拖拽的控制点确定主要调整方向
                 if (handle.includes('t') || handle.includes('b')) {
+                    // 垂直方向调整，宽度跟随高度变化
                     newWidth = newHeight * aspectRatio;
                     if (handle.includes('l')) {
                         newX = originalElement.x + originalElement.width - newWidth;
                     }
-                } else {
+                } else if (handle.includes('l') || handle.includes('r')) {
+                    // 水平方向调整，高度跟随宽度变化
                     newHeight = newWidth / aspectRatio;
                     if (handle.includes('t')) {
                         newY = originalElement.y + originalElement.height - newHeight;
+                    }
+                } else {
+                    // 角落控制点：根据变化较大的方向来决定
+                    const widthChange = Math.abs(newWidth - originalElement.width);
+                    const heightChange = Math.abs(newHeight - originalElement.height);
+                    
+                    if (widthChange > heightChange) {
+                        // 宽度变化更大，高度跟随宽度
+                        newHeight = newWidth / aspectRatio;
+                        if (handle.includes('t')) {
+                            newY = originalElement.y + originalElement.height - newHeight;
+                        }
+                    } else {
+                        // 高度变化更大，宽度跟随高度
+                        newWidth = newHeight * aspectRatio;
+                        if (handle.includes('l')) {
+                            newX = originalElement.x + originalElement.width - newWidth;
+                        }
                     }
                 }
             }
@@ -464,13 +504,16 @@ const App: React.FC = () => {
         reader.onload = () => {
             const img = new Image();
             img.onload = () => {
+                // 计算自适应尺寸
+                const adaptiveSize = calculateAdaptiveImageSize(img.width, img.height);
+                
                 const newImageElement: Element = {
                     id: generateId(),
                     type: 'image',
                     x: 100,
                     y: 100,
-                    width: img.width,
-                    height: img.height,
+                    width: adaptiveSize.width,
+                    height: adaptiveSize.height,
                     href: img.src,
                     mimeType: file.type,
                 };
@@ -799,13 +842,16 @@ const App: React.FC = () => {
         const img = new Image();
         img.crossOrigin = 'anonymous';
         img.onload = () => {
+            // 计算自适应尺寸
+            const adaptiveSize = calculateAdaptiveImageSize(img.width, img.height);
+            
             const newImageElement: Element = {
                 id: generateId(),
                 type: 'image',
                 x: 100,
                 y: 100,
-                width: img.width,
-                height: img.height,
+                width: adaptiveSize.width,
+                height: adaptiveSize.height,
                 href: url,
                 mimeType: 'image/png', // 默认类型，实际可能不同
             };
@@ -965,7 +1011,21 @@ const App: React.FC = () => {
                                 if (selectedElementIds.length > 1 || (el.type === 'path')) {
                                      const bounds = getElementBounds(el);
                                      selectionComponent = <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} fill="none" stroke="rgb(59 130 246)" strokeWidth={2/zoom} strokeDasharray={`${6/zoom} ${4/zoom}`} pointerEvents="none" />
-                                } else if ((el.type === 'image' || el.type === 'shape')) {
+                                } else if (el.type === 'image') {
+                                    // 图片元素只显示四个角的控制点，保持比例缩放
+                                    const handleSize = 8 / zoom;
+                                    const handles = [
+                                        { name: 'tl', x: el.x, y: el.y, cursor: 'nwse-resize' },
+                                        { name: 'tr', x: el.x + el.width, y: el.y, cursor: 'nesw-resize' },
+                                        { name: 'bl', x: el.x, y: el.y + el.height, cursor: 'nesw-resize' },
+                                        { name: 'br', x: el.x + el.width, y: el.y + el.height, cursor: 'nwse-resize' },
+                                    ];
+                                     selectionComponent = <g>
+                                        <rect x={el.x} y={el.y} width={el.width} height={el.height} fill="none" stroke="rgb(59 130 246)" strokeWidth={2 / zoom} pointerEvents="none" />
+                                        {handles.map(h => <rect key={h.name} data-handle={h.name} x={h.x - handleSize / 2} y={h.y - handleSize / 2} width={handleSize} height={handleSize} fill="white" stroke="#3b82f6" strokeWidth={1 / zoom} style={{ cursor: h.cursor }} pointerEvents="all" />)}
+                                    </g>;
+                                } else if (el.type === 'shape') {
+                                    // 形状元素显示所有控制点
                                     const handleSize = 8 / zoom;
                                     const handles = [
                                         { name: 'tl', x: el.x, y: el.y, cursor: 'nwse-resize' }, { name: 'tm', x: el.x + el.width / 2, y: el.y, cursor: 'ns-resize' }, { name: 'tr', x: el.x + el.width, y: el.y, cursor: 'nesw-resize' },
