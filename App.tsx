@@ -5,6 +5,7 @@ import { PromptBar } from './components/PromptBar';
 import { Loader } from './components/Loader';
 import { CanvasSettings } from './components/CanvasSettings';
 import { ImageUrlUpload } from './components/ImageUrlUpload';
+import { CanvasSizeSlider } from './components/CanvasSizeSlider';
 import type { Tool, Point, Element, ImageElement, PathElement, ShapeElement } from './types';
 import { fileToDataUrl } from './utils/fileUtils';
 import { createElement, getElementAtPosition, generateId } from './utils/elementUtils';
@@ -48,6 +49,7 @@ const App: React.FC = () => {
     const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
     const [selectionBox, setSelectionBox] = useState<Rect | null>(null);
     const [prompt, setPrompt] = useState('');
+    const [canvasSize, setCanvasSize] = useState(100);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [isSettingsPanelOpen, setIsSettingsPanelOpen] = useState(false);
@@ -128,8 +130,9 @@ const App: React.FC = () => {
         const rect = svgRef.current?.getBoundingClientRect();
         if (!rect) return;
         
-        const canvasX = (event.clientX - rect.left - panOffset.x) / zoom;
-        const canvasY = (event.clientY - rect.top - panOffset.y) / zoom;
+        const scaleFactor = canvasSize / 100;
+        const canvasX = ((event.clientX - rect.left) / scaleFactor - panOffset.x) / zoom;
+        const canvasY = ((event.clientY - rect.top) / scaleFactor - panOffset.y) / zoom;
         
         startPoint.current = { x: canvasX, y: canvasY };
         
@@ -222,8 +225,9 @@ const App: React.FC = () => {
         const rect = svgRef.current?.getBoundingClientRect();
         if (!rect) return;
         
-        const canvasX = (event.clientX - rect.left - panOffset.x) / zoom;
-        const canvasY = (event.clientY - rect.top - panOffset.y) / zoom;
+        const scaleFactor = canvasSize / 100;
+        const canvasX = ((event.clientX - rect.left) / scaleFactor - panOffset.x) / zoom;
+        const canvasY = ((event.clientY - rect.top) / scaleFactor - panOffset.y) / zoom;
         
         if (croppingState && cropStartInfo.current) {
             const dx = canvasX - cropStartInfo.current.startCanvasPoint.x;
@@ -861,6 +865,29 @@ const App: React.FC = () => {
         return () => window.removeEventListener('paste', handlePaste);
     }, [handleAddImageElement]);
 
+    // 画布尺寸变化处理
+    const handleCanvasSizeChange = useCallback((newSize: number) => {
+        setCanvasSize(newSize);
+    }, []);
+
+    // 快捷键处理
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.ctrlKey || e.metaKey) {
+                if (e.key === '=' || e.key === '+') {
+                    e.preventDefault();
+                    setCanvasSize(prev => Math.min(200, prev + 10));
+                } else if (e.key === '-') {
+                    e.preventDefault();
+                    setCanvasSize(prev => Math.max(50, prev - 10));
+                }
+            }
+        };
+        
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, []);
+
     const selectedImageElements = elements.filter(el => selectedElementIds.includes(el.id) && el.type === 'image');
     const isImageSelectionActive = selectedImageElements.length > 0;
     const singleSelectedElement = selectedElementIds.length === 1 ? elements.find(el => el.id === selectedElementIds[0]) : null;
@@ -901,6 +928,12 @@ const App: React.FC = () => {
                 canRedo={historyIndex < history.length - 1}
             />
             <div className="flex-grow relative overflow-hidden">
+                <CanvasSizeSlider 
+                    canvasSize={canvasSize}
+                    onSizeChange={handleCanvasSizeChange}
+                    minSize={50}
+                    maxSize={200}
+                />
                 <svg
                     ref={svgRef}
                     className="w-full h-full"
@@ -910,7 +943,11 @@ const App: React.FC = () => {
                     onMouseLeave={handleMouseUp}
                     onWheel={handleWheel}
                     onContextMenu={handleContextMenu}
-                    style={{ cursor }}
+                    style={{ 
+                        cursor,
+                        transform: `scale(${canvasSize / 100})`,
+                        transformOrigin: 'center center'
+                    }}
                 >
                     <g transform={`translate(${panOffset.x}, ${panOffset.y}) scale(${zoom})`}>
                         <defs>
