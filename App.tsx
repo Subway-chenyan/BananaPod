@@ -4,9 +4,11 @@ import { Toolbar } from './components/Toolbar';
 import { PromptBar } from './components/PromptBar';
 import { Loader } from './components/Loader';
 import { CanvasSettings } from './components/CanvasSettings';
+import { ImageUrlUpload } from './components/ImageUrlUpload';
 import type { Tool, Point, Element, ImageElement, PathElement, ShapeElement } from './types';
 import { fileToDataUrl } from './utils/fileUtils';
 import { createElement, getElementAtPosition, generateId } from './utils/elementUtils';
+import { editImage } from './services/geminiService';
 import { saveAs } from 'file-saver';
 
 const getElementBounds = (element: Element): { x: number; y: number; width: number; height: number } => {
@@ -50,6 +52,7 @@ const App: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [isSettingsPanelOpen, setIsSettingsPanelOpen] = useState(false);
     const [canvasBackgroundColor, setCanvasBackgroundColor] = useState<string>('#f3f4f6');
+    const [showUrlUpload, setShowUrlUpload] = useState(false);
     const [croppingState, setCroppingState] = useState<{ elementId: string; originalElement: ImageElement; cropBox: Rect } | null>(null);
     const [alignmentGuides, setAlignmentGuides] = useState<Guide[]>([]);
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; elementId: string } | null>(null);
@@ -618,23 +621,110 @@ const App: React.FC = () => {
         if (!prompt.trim()) return;
         setIsGenerating(true);
         try {
-            // For now, create a placeholder image since generateImage doesn't exist
-             const result = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
-            const newImageElement: Element = {
-                id: generateId(),
-                type: 'image',
-                x: 100,
-                y: 100,
-                width: 512,
-                height: 512,
-                href: result,
-                mimeType: 'image/png',
-            };
-            const newElements = [...elements, newImageElement];
-            setElements(newElements);
-            commitAction(newElements);
+            // 获取选中的图片作为输入
+            const selectedImageElements = elements.filter(el => 
+                selectedElementIds.includes(el.id) && el.type === 'image'
+            ) as ImageElement[];
+            
+            // 如果没有选中图片，创建一个默认的白色背景图片
+            let inputImages: { href: string; mimeType: string }[] = [];
+            
+            if (selectedImageElements.length === 0) {
+                // 创建一个白色背景的canvas作为默认输入
+                const canvas = document.createElement('canvas');
+                canvas.width = 512;
+                canvas.height = 512;
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                    ctx.fillStyle = 'white';
+                    ctx.fillRect(0, 0, 512, 512);
+                    const dataUrl = canvas.toDataURL('image/png');
+                    inputImages = [{ href: dataUrl, mimeType: 'image/png' }];
+                }
+            } else {
+                // 将选中的图片转换为base64格式
+                const convertedImages = await Promise.all(
+                    selectedImageElements.map(async (el) => {
+                        if (el.href.startsWith('data:')) {
+                            // 已经是data URL格式
+                            return { href: el.href, mimeType: el.mimeType };
+                        } else {
+                            // 是URL，需要转换为base64
+                            try {
+                                const canvas = document.createElement('canvas');
+                                const ctx = canvas.getContext('2d');
+                                const img = new Image();
+                                img.crossOrigin = 'anonymous';
+                                
+                                return new Promise<{ href: string; mimeType: string }>((resolve, reject) => {
+                                    img.onload = () => {
+                                        canvas.width = img.width;
+                                        canvas.height = img.height;
+                                        ctx?.drawImage(img, 0, 0);
+                                        const dataUrl = canvas.toDataURL(el.mimeType || 'image/png');
+                                        resolve({ href: dataUrl, mimeType: el.mimeType || 'image/png' });
+                                    };
+                                    img.onerror = () => reject(new Error(`Failed to load image: ${el.href}`));
+                                    img.src = el.href;
+                                });
+                            } catch (error) {
+                                console.warn(`Failed to convert image ${el.href}:`, error);
+                                // 如果转换失败，创建一个白色背景作为替代
+                                const canvas = document.createElement('canvas');
+                                canvas.width = 512;
+                                canvas.height = 512;
+                                const ctx = canvas.getContext('2d');
+                                if (ctx) {
+                                    ctx.fillStyle = 'white';
+                                    ctx.fillRect(0, 0, 512, 512);
+                                    const dataUrl = canvas.toDataURL('image/png');
+                                    return { href: dataUrl, mimeType: 'image/png' };
+                                }
+                                throw error;
+                            }
+                        }
+                    })
+                );
+                inputImages = convertedImages;
+            }
+            
+            // 调用Gemini API生成图片
+            const result = await editImage(inputImages, prompt);
+            
+            if (result.newImageBase64 && result.newImageMimeType) {
+                const dataUrl = `data:${result.newImageMimeType};base64,${result.newImageBase64}`;
+                
+                // 创建新的图片元素
+                const newImageElement: Element = {
+                    id: generateId(),
+                    type: 'image',
+                    x: 100,
+                    y: 100,
+                    width: 512,
+                    height: 512,
+                    href: dataUrl,
+                    mimeType: result.newImageMimeType,
+                };
+                
+                const newElements = [...elements, newImageElement];
+                setElements(newElements);
+                commitAction(newElements);
+                
+                // 如果有文本响应，可以在控制台显示
+                if (result.textResponse) {
+                    console.log('AI Response:', result.textResponse);
+                }
+            } else {
+                // 如果没有生成图片，显示错误信息
+                const errorMessage = result.textResponse || 'Failed to generate image';
+                setError(errorMessage);
+                setTimeout(() => setError(null), 5000);
+            }
         } catch (error) {
             console.error('Error generating art:', error);
+            const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+            setError(`Failed to generate image: ${errorMessage}`);
+            setTimeout(() => setError(null), 5000);
         } finally {
             setIsGenerating(false);
         }
@@ -694,6 +784,35 @@ const App: React.FC = () => {
             };
             reader.readAsDataURL(file);
         }
+    };
+
+    const handleUrlUpload = (url: string) => {
+        if (url === '') {
+            setShowUrlUpload(true);
+            return;
+        }
+        
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+            const newImageElement: Element = {
+                id: generateId(),
+                type: 'image',
+                x: 100,
+                y: 100,
+                width: img.width,
+                height: img.height,
+                href: url,
+                mimeType: 'image/png', // 默认类型，实际可能不同
+            };
+            const newElements = [...elements, newImageElement];
+            setElements(newElements);
+            commitAction(newElements);
+        };
+        img.onerror = () => {
+            console.error('Failed to load image from URL:', url);
+        };
+        img.src = url;
     };
 
     const handleFillColorChange = (elementId: string, newColor: string) => {
@@ -771,6 +890,7 @@ const App: React.FC = () => {
                 drawingOptions={drawingOptions}
                 setDrawingOptions={setDrawingOptions}
                 onUpload={handleAddImageElement}
+                onUrlUpload={handleUrlUpload}
                 isCropping={!!croppingState}
                 onConfirmCrop={handleConfirmCrop}
                 onCancelCrop={handleCancelCrop}
@@ -937,7 +1057,14 @@ const App: React.FC = () => {
                     </div>
                 )}
             </div>
-            {!croppingState && <PromptBar prompt={prompt} setPrompt={setPrompt} onGenerate={handleGenerate} isLoading={isLoading} isImageSelectionActive={isImageSelectionActive} selectedImageCount={selectedImageElements.length} />}
+            {!croppingState && <PromptBar prompt={prompt} setPrompt={setPrompt} onGenerate={handleGenerate} isLoading={isGenerating} isImageSelectionActive={isImageSelectionActive} selectedImageCount={selectedImageElements.length} />}
+            {showUrlUpload && (
+                <ImageUrlUpload
+                    onUpload={handleUrlUpload}
+                    onClose={() => setShowUrlUpload(false)}
+                />
+            )}
+            {isGenerating && <Loader />}
         </div>
     );
 };

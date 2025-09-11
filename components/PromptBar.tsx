@@ -4,7 +4,7 @@ import { QuickPrompts } from './QuickPrompts';
 interface PromptBarProps {
     prompt: string;
     setPrompt: (prompt: string) => void;
-    onGenerate: () => void;
+    onGenerate: (prompt: string) => void;
     isLoading: boolean;
     isImageSelectionActive: boolean;
     selectedImageCount: number;
@@ -45,7 +45,7 @@ export const PromptBar: React.FC<PromptBarProps> = ({
                         disabled={!isImageSelectionActive || isLoading}
                     />
                     <button
-                        onClick={onGenerate}
+                        onClick={() => onGenerate(prompt)}
                         disabled={isLoading || !isImageSelectionActive || !prompt.trim()}
                         className="px-4 py-2 bg-blue-500 text-white font-semibold rounded-md disabled:bg-gray-300 disabled:cursor-not-allowed hover:bg-blue-600 transition-colors duration-200 flex items-center"
                     >
