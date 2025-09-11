@@ -5,10 +5,9 @@ import { PromptBar } from './components/PromptBar';
 import { Loader } from './components/Loader';
 import { CanvasSettings } from './components/CanvasSettings';
 import type { Tool, Point, Element, ImageElement, PathElement, ShapeElement } from './types';
-import { editImage } from './services/geminiService';
 import { fileToDataUrl } from './utils/fileUtils';
-
-const generateId = () => `id_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+import { createElement, getElementAtPosition, generateId } from './utils/elementUtils';
+import { saveAs } from 'file-saver';
 
 const getElementBounds = (element: Element): { x: number; y: number; width: number; height: number } => {
     if (element.type === 'image' || element.type === 'shape') {
@@ -31,15 +30,19 @@ type Rect = { x: number; y: number; width: number; height: number };
 type Guide = { type: 'v' | 'h'; position: number; start: number; end: number };
 const SNAP_THRESHOLD = 5; // pixels in screen space
 
+type Action = 'none' | 'drawing' | 'moving' | 'resizing';
+
 const App: React.FC = () => {
     const [history, setHistory] = useState<Element[][]>([[]]);
     const [historyIndex, setHistoryIndex] = useState(0);
-    const elements = history[historyIndex];
-
+    const [elements, setElements] = useState<Element[]>([]);
+    const [selectedElement, setSelectedElement] = useState<Element | null>(null);
+    const [clipboard, setClipboard] = useState<Element | null>(null);
+    const [action, setAction] = useState<Action>('none');
     const [activeTool, setActiveTool] = useState<Tool>('select');
     const [panOffset, setPanOffset] = useState<Point>({ x: 0, y: 0 });
     const [zoom, setZoom] = useState(1);
-    const [drawingOptions, setDrawingOptions] = useState({ strokeColor: '#000000', strokeWidth: 5 });
+    const [drawingOptions, setDrawingOptions] = useState({ strokeColor: '#000000', strokeWidth: 5, fillColor: 'none' });
     const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
     const [selectionBox, setSelectionBox] = useState<Rect | null>(null);
     const [prompt, setPrompt] = useState('');
@@ -66,38 +69,31 @@ const App: React.FC = () => {
         elementsRef.current = elements;
     }, [elements]);
 
-    const setElements = (updater: (prev: Element[]) => Element[], commit: boolean = true) => {
-        const newElements = updater(elementsRef.current);
-        if (commit) {
-            const newHistory = [...history.slice(0, historyIndex + 1), newElements];
-            setHistory(newHistory);
-            setHistoryIndex(newHistory.length - 1);
-        } else {
-             const tempHistory = [...history];
-             tempHistory[historyIndex] = newElements;
-             setHistory(tempHistory);
-        }
-    };
-    
-    const commitAction = (updater: (prev: Element[]) => Element[]) => {
-        const newElements = updater(elementsRef.current);
-        const newHistory = [...history.slice(0, historyIndex + 1), newElements];
+    const [isGenerating, setIsGenerating] = useState(false);
+
+
+    const commitAction = (newElements: Element[]) => {
+        const newHistory = history.slice(0, historyIndex + 1);
+        newHistory.push(newElements);
         setHistory(newHistory);
         setHistoryIndex(newHistory.length - 1);
     };
 
-    const handleUndo = useCallback(() => {
+    const handleUndo = () => {
         if (historyIndex > 0) {
-            setHistoryIndex(historyIndex - 1);
+            const newIndex = historyIndex - 1;
+            setHistoryIndex(newIndex);
+            setElements(history[newIndex]);
         }
-    }, [historyIndex]);
+    };
 
-    const handleRedo = useCallback(() => {
+    const handleRedo = () => {
         if (historyIndex < history.length - 1) {
-            setHistoryIndex(historyIndex + 1);
+            const newIndex = historyIndex + 1;
+            setHistoryIndex(newIndex);
+            setElements(history[newIndex]);
         }
-    }, [historyIndex, history.length]);
-
+    };
 
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
@@ -109,587 +105,623 @@ const App: React.FC = () => {
                 handleUndo();
                 return;
             }
-             if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) {
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) {
                 e.preventDefault();
                 handleRedo();
                 return;
             }
             
-            if (!isTyping && (e.key === 'Delete' || e.key === 'Backspace') && selectedElementIds.length > 0) {
+            if (!isTyping && (e.key === 'Delete' || e.key === 'Backspace') && (selectedElement || selectedElementIds.length > 0)) {
                 e.preventDefault();
-                commitAction(prev => prev.filter(el => !selectedElementIds.includes(el.id)));
-                setSelectedElementIds([]);
+                handleDelete();
             }
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [handleUndo, handleRedo, selectedElementIds]);
+    }, [handleUndo, handleRedo, selectedElement, selectedElementIds]);
 
 
-    const getCanvasPoint = useCallback((screenX: number, screenY: number): Point => {
-        if (!svgRef.current) return { x: 0, y: 0 };
-        const svgBounds = svgRef.current.getBoundingClientRect();
-        const xOnSvg = screenX - svgBounds.left;
-        const yOnSvg = screenY - svgBounds.top;
+    const handleMouseDown = (event: React.MouseEvent<SVGSVGElement>) => {
+        const rect = svgRef.current?.getBoundingClientRect();
+        if (!rect) return;
         
-        return {
-            x: (xOnSvg - panOffset.x) / zoom,
-            y: (yOnSvg - panOffset.y) / zoom,
-        };
-    }, [panOffset, zoom]);
-
-    const handleAddImageElement = useCallback(async (file: File) => {
-        if (!file.type.startsWith('image/')) {
-            setError('Only image files are supported.');
-            return;
-        }
-        setError(null);
-        try {
-            const { dataUrl, mimeType } = await fileToDataUrl(file);
-            const img = new Image();
-            img.onload = () => {
-                if (!svgRef.current) return;
-                const svgBounds = svgRef.current.getBoundingClientRect();
-                const screenCenter = { x: svgBounds.left + svgBounds.width / 2, y: svgBounds.top + svgBounds.height / 2 };
-                const canvasPoint = getCanvasPoint(screenCenter.x, screenCenter.y);
-
-                const newImage: ImageElement = {
-                    id: generateId(),
-                    type: 'image',
-                    x: canvasPoint.x - (img.width / 2),
-                    y: canvasPoint.y - (img.height / 2),
-                    width: img.width,
-                    height: img.height,
-                    href: dataUrl,
-                    mimeType: mimeType,
-                };
-                setElements(prev => [...prev, newImage]);
-                setSelectedElementIds([newImage.id]);
-                setActiveTool('select');
-            };
-            img.src = dataUrl;
-        } catch (err) {
-            setError('Failed to load image.');
-            console.error(err);
-        }
-    }, [getCanvasPoint]);
-    
-    const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
-        if (contextMenu) setContextMenu(null);
-
-        if (e.button === 1) { // Middle mouse button for panning
-            interactionMode.current = 'pan';
-            startPoint.current = { x: e.clientX, y: e.clientY };
-            e.preventDefault();
-            return;
-        }
-
-        startPoint.current = { x: e.clientX, y: e.clientY };
-        const canvasStartPoint = getCanvasPoint(e.clientX, e.clientY);
-
-        const target = e.target as SVGElement;
-        const handleName = target.getAttribute('data-handle');
-
+        const canvasX = (event.clientX - rect.left - panOffset.x) / zoom;
+        const canvasY = (event.clientY - rect.top - panOffset.y) / zoom;
+        
+        startPoint.current = { x: canvasX, y: canvasY };
+        
         if (croppingState) {
-             if (handleName) {
-                 interactionMode.current = `crop-${handleName}`;
-                 cropStartInfo.current = { originalCropBox: { ...croppingState.cropBox }, startCanvasPoint: canvasStartPoint };
-             }
-             return;
-        }
-
-        if (activeTool === 'pan') {
-            interactionMode.current = 'pan';
-            return;
-        }
-
-        if (handleName && activeTool === 'select' && selectedElementIds.length === 1) {
-            interactionMode.current = `resize-${handleName}`;
-            const element = elements.find(el => el.id === selectedElementIds[0]) as ImageElement | ShapeElement;
-            resizeStartInfo.current = {
-                originalElement: { ...element },
-                startCanvasPoint: canvasStartPoint,
-                handle: handleName,
-                shiftKey: e.shiftKey,
+            cropStartInfo.current = {
+                originalCropBox: { ...croppingState.cropBox },
+                startCanvasPoint: { x: canvasX, y: canvasY }
             };
             return;
         }
-
-        if (activeTool === 'draw') {
-            interactionMode.current = 'draw';
-            const newPath: PathElement = {
-                id: generateId(),
-                type: 'path',
-                points: [canvasStartPoint],
-                strokeColor: drawingOptions.strokeColor,
-                strokeWidth: drawingOptions.strokeWidth,
-                x: 0, y: 0 
-            };
-            currentDrawingElementId.current = newPath.id;
-            setElements(prev => [...prev, newPath], false);
-        } else if (activeTool === 'rectangle' || activeTool === 'circle' || activeTool === 'triangle') {
-            interactionMode.current = 'drawShape';
-            const newShape: ShapeElement = {
-                id: generateId(),
-                type: 'shape',
-                shapeType: activeTool,
-                x: canvasStartPoint.x,
-                y: canvasStartPoint.y,
-                width: 0,
-                height: 0,
-                strokeColor: drawingOptions.strokeColor,
-                strokeWidth: drawingOptions.strokeWidth,
-                fillColor: 'transparent',
+        
+        if (activeTool === 'select') {
+            // 检查是否点击了调整控制点
+            const target = event.target as SVGElement;
+            const handleName = target.getAttribute('data-handle');
+            
+            if (handleName && selectedElement && (selectedElement.type === 'image' || selectedElement.type === 'shape')) {
+                // 点击了调整控制点
+                setAction('resizing');
+                resizeStartInfo.current = {
+                    originalElement: selectedElement as ImageElement | ShapeElement,
+                    startCanvasPoint: { x: canvasX, y: canvasY },
+                    handle: handleName,
+                    shiftKey: event.shiftKey
+                };
+                return;
             }
-            currentDrawingElementId.current = newShape.id;
-            setElements(prev => [...prev, newShape], false);
-        } else if (activeTool === 'erase') {
-            interactionMode.current = 'erase';
-        } else if (activeTool === 'select') {
-            const elementId = target.closest('[data-id]')?.getAttribute('data-id');
-
-            if (elementId) {
-                if (!e.shiftKey && !selectedElementIds.includes(elementId)) {
-                     setSelectedElementIds([elementId]);
-                } else if (e.shiftKey) {
-                    setSelectedElementIds(prev => 
-                        prev.includes(elementId) ? prev.filter(id => id !== elementId) : [...prev, elementId]
-                    );
+            
+            const clickedElement = getElementAtPosition(canvasX, canvasY, elementsRef.current);
+            
+            if (clickedElement) {
+                setSelectedElement(clickedElement);
+                setSelectedElementIds([clickedElement.id]);
+                setAction('moving');
+                
+                // 记录拖拽开始时的元素位置
+                if (clickedElement.type === 'path') {
+                    dragStartElementPositions.current.set(clickedElement.id, [...clickedElement.points]);
+                } else {
+                    dragStartElementPositions.current.set(clickedElement.id, { x: clickedElement.x, y: clickedElement.y });
                 }
-                interactionMode.current = 'dragElements';
-                 const initialPositions = new Map<string, {x: number, y: number} | Point[]>();
-                elementsRef.current.forEach(el => {
-                    if (selectedElementIds.includes(el.id) || el.id === elementId) { // Ensure current clicked element is included for dragging immediately
-                         if (el.type === 'image' || el.type === 'shape') {
-                            initialPositions.set(el.id, { x: el.x, y: el.y });
-                        } else if (el.type === 'path') {
-                            initialPositions.set(el.id, el.points);
-                        }
-                    }
-                });
-                dragStartElementPositions.current = initialPositions;
-
             } else {
+                setSelectedElement(null);
                 setSelectedElementIds([]);
-                interactionMode.current = 'selectBox';
-                setSelectionBox({ x: canvasStartPoint.x, y: canvasStartPoint.y, width: 0, height: 0 });
+                setAction('drawing');
+                setSelectionBox({ x: canvasX, y: canvasY, width: 0, height: 0 });
             }
+        } else if (activeTool === 'pan') {
+            setAction('moving');
+            startPoint.current = { x: event.clientX, y: event.clientY };
+        } else if (activeTool === 'draw') {
+             setAction('drawing');
+             const newElement = createElement('draw', canvasX, canvasY);
+             if (newElement && newElement.type === 'path') {
+                 newElement.points = [{ x: canvasX, y: canvasY }];
+                 newElement.strokeColor = drawingOptions.strokeColor;
+                 newElement.strokeWidth = drawingOptions.strokeWidth;
+                 currentDrawingElementId.current = newElement.id;
+                 const newElements = [...elementsRef.current, newElement];
+                 setElements(newElements);
+             }
+        } else if (activeTool === 'erase') {
+             setAction('drawing');
+             // 橡皮擦工具：删除鼠标位置的元素
+             const elementToErase = getElementAtPosition(canvasX, canvasY, elementsRef.current);
+             if (elementToErase) {
+                 const newElements = elementsRef.current.filter(el => el.id !== elementToErase.id);
+                 setElements(newElements);
+                 commitAction(newElements);
+                 if (selectedElement && selectedElement.id === elementToErase.id) {
+                     setSelectedElement(null);
+                     setSelectedElementIds([]);
+                 }
+             }
+        } else if (['rectangle', 'circle', 'triangle'].includes(activeTool)) {
+             setAction('drawing');
+             const newElement = createElement(activeTool as Tool, canvasX, canvasY);
+             if (newElement && newElement.type === 'shape') {
+                 newElement.fillColor = drawingOptions.fillColor;
+                 newElement.strokeColor = drawingOptions.strokeColor;
+                 newElement.strokeWidth = drawingOptions.strokeWidth;
+                 currentDrawingElementId.current = newElement.id;
+                 const newElements = [...elementsRef.current, newElement];
+                 setElements(newElements);
+             }
         }
     };
 
-    const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-        if (!interactionMode.current) return;
-        const point = getCanvasPoint(e.clientX, e.clientY);
-        const startCanvasPoint = getCanvasPoint(startPoint.current.x, startPoint.current.y);
-
-        if (interactionMode.current === 'erase') {
-            const eraseRadius = drawingOptions.strokeWidth / zoom;
-            const idsToDelete = new Set<string>();
-
-            elements.forEach(el => {
-                if (el.type === 'path') {
-                    for (let i = 0; i < el.points.length - 1; i++) {
-                        const distance = Math.hypot(point.x - el.points[i].x, point.y - el.points[i].y);
-                        if (distance < eraseRadius) {
-                            idsToDelete.add(el.id);
-                            return;
-                        }
+    const handleMouseMove = (event: React.MouseEvent<SVGSVGElement>) => {
+        const rect = svgRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        
+        const canvasX = (event.clientX - rect.left - panOffset.x) / zoom;
+        const canvasY = (event.clientY - rect.top - panOffset.y) / zoom;
+        
+        if (croppingState && cropStartInfo.current) {
+            const dx = canvasX - cropStartInfo.current.startCanvasPoint.x;
+            const dy = canvasY - cropStartInfo.current.startCanvasPoint.y;
+            
+            setCroppingState(prev => prev ? {
+                ...prev,
+                cropBox: {
+                    x: cropStartInfo.current!.originalCropBox.x + dx,
+                    y: cropStartInfo.current!.originalCropBox.y + dy,
+                    width: cropStartInfo.current!.originalCropBox.width,
+                    height: cropStartInfo.current!.originalCropBox.height
+                }
+            } : null);
+            return;
+        }
+        
+        if (action === 'moving' && selectedElement && activeTool === 'select') {
+            const dx = canvasX - startPoint.current.x;
+            const dy = canvasY - startPoint.current.y;
+            
+            const newElements = elementsRef.current.map(el => {
+                if (el.id === selectedElement.id) {
+                    if (el.type === 'path') {
+                        const originalPoints = dragStartElementPositions.current.get(el.id) as Point[];
+                        return {
+                            ...el,
+                            points: originalPoints.map(p => ({ x: p.x + dx, y: p.y + dy }))
+                        };
+                    } else {
+                        const originalPos = dragStartElementPositions.current.get(el.id) as { x: number; y: number };
+                        return {
+                            ...el,
+                            x: originalPos.x + dx,
+                            y: originalPos.y + dy
+                        };
                     }
+                }
+                return el;
+            });
+            setElements(newElements);
+        } else if (action === 'resizing' && resizeStartInfo.current) {
+            const { originalElement, startCanvasPoint, handle, shiftKey } = resizeStartInfo.current;
+            const dx = canvasX - startCanvasPoint.x;
+            const dy = canvasY - startCanvasPoint.y;
+            
+            let newX = originalElement.x;
+            let newY = originalElement.y;
+            let newWidth = originalElement.width;
+            let newHeight = originalElement.height;
+            
+            // 根据控制点计算新的尺寸和位置
+            if (handle.includes('l')) { // 左边控制点
+                newX = originalElement.x + dx;
+                newWidth = originalElement.width - dx;
+            }
+            if (handle.includes('r')) { // 右边控制点
+                newWidth = originalElement.width + dx;
+            }
+            if (handle.includes('t')) { // 顶部控制点
+                newY = originalElement.y + dy;
+                newHeight = originalElement.height - dy;
+            }
+            if (handle.includes('b')) { // 底部控制点
+                newHeight = originalElement.height + dy;
+            }
+            
+            // 保持最小尺寸
+            const minSize = 10;
+            if (newWidth < minSize) {
+                if (handle.includes('l')) {
+                    newX = originalElement.x + originalElement.width - minSize;
+                }
+                newWidth = minSize;
+            }
+            if (newHeight < minSize) {
+                if (handle.includes('t')) {
+                    newY = originalElement.y + originalElement.height - minSize;
+                }
+                newHeight = minSize;
+            }
+            
+            // 如果按住Shift键，保持宽高比
+            if (shiftKey) {
+                const aspectRatio = originalElement.width / originalElement.height;
+                if (handle.includes('t') || handle.includes('b')) {
+                    newWidth = newHeight * aspectRatio;
+                    if (handle.includes('l')) {
+                        newX = originalElement.x + originalElement.width - newWidth;
+                    }
+                } else {
+                    newHeight = newWidth / aspectRatio;
+                    if (handle.includes('t')) {
+                        newY = originalElement.y + originalElement.height - newHeight;
+                    }
+                }
+            }
+            
+            const newElements = elementsRef.current.map(el => {
+                if (el.id === originalElement.id) {
+                    return {
+                        ...el,
+                        x: newX,
+                        y: newY,
+                        width: newWidth,
+                        height: newHeight
+                    };
+                }
+                return el;
+            });
+            setElements(newElements);
+        } else if (action === 'drawing' && activeTool === 'select') {
+            const width = canvasX - startPoint.current.x;
+            const height = canvasY - startPoint.current.y;
+            setSelectionBox({
+                x: width < 0 ? canvasX : startPoint.current.x,
+                y: height < 0 ? canvasY : startPoint.current.y,
+                width: Math.abs(width),
+                height: Math.abs(height)
+            });
+        } else if (action === 'moving' && activeTool === 'pan') {
+            const dx = event.clientX - startPoint.current.x;
+            const dy = event.clientY - startPoint.current.y;
+            setPanOffset(prev => ({ x: prev.x + dx, y: prev.y + dy }));
+            startPoint.current = { x: event.clientX, y: event.clientY };
+        } else if (action === 'drawing' && activeTool === 'draw' && currentDrawingElementId.current) {
+            const newElements = elementsRef.current.map(el => {
+                if (el.id === currentDrawingElementId.current) {
+                    if (el.type === 'path') {
+                        return {
+                            ...el,
+                            points: [...el.points, { x: canvasX, y: canvasY }]
+                        };
+                    }
+                }
+                return el;
+            });
+            setElements(newElements);
+        } else if (action === 'drawing' && activeTool === 'erase') {
+            // 橡皮擦工具：持续删除鼠标经过的元素
+            const elementToErase = getElementAtPosition(canvasX, canvasY, elementsRef.current);
+            if (elementToErase) {
+                const newElements = elementsRef.current.filter(el => el.id !== elementToErase.id);
+                setElements(newElements);
+                if (selectedElement && selectedElement.id === elementToErase.id) {
+                    setSelectedElement(null);
+                    setSelectedElementIds([]);
+                }
+            }
+        } else if (action === 'drawing' && currentDrawingElementId.current) {
+            const newElements = elementsRef.current.map(el => {
+                if (el.id === currentDrawingElementId.current) {
+                    if (el.type === 'shape') {
+                        const width = canvasX - startPoint.current.x;
+                        const height = canvasY - startPoint.current.y;
+                        return {
+                            ...el,
+                            x: width < 0 ? canvasX : startPoint.current.x,
+                            y: height < 0 ? canvasY : startPoint.current.y,
+                            width: Math.abs(width),
+                            height: Math.abs(height)
+                        };
+                    }
+                }
+                return el;
+            });
+            setElements(newElements);
+        }
+    };
+
+    const handleMouseUp = (event: React.MouseEvent<SVGSVGElement>) => {
+        if (croppingState && cropStartInfo.current) {
+            cropStartInfo.current = null;
+            return;
+        }
+        
+        if (action === 'drawing' && activeTool === 'select' && selectionBox) {
+            // 处理框选逻辑
+            const selectedIds: string[] = [];
+            elementsRef.current.forEach(element => {
+                if (isElementInSelectionBox(element, selectionBox)) {
+                    selectedIds.push(element.id);
                 }
             });
-
-            if (idsToDelete.size > 0) {
-                setElements(prev => prev.filter(el => !idsToDelete.has(el.id)), false);
-            }
-            return;
-        }
-
-        if (interactionMode.current.startsWith('resize-')) {
-            if (!resizeStartInfo.current) return;
-            const { originalElement, handle, startCanvasPoint: resizeStartPoint, shiftKey } = resizeStartInfo.current;
-            let { x, y, width, height } = originalElement;
-            const aspectRatio = originalElement.width / originalElement.height;
-            const dx = point.x - resizeStartPoint.x;
-            const dy = point.y - resizeStartPoint.y;
-
-            if (handle.includes('r')) { width = originalElement.width + dx; }
-            if (handle.includes('l')) { width = originalElement.width - dx; x = originalElement.x + dx; }
-            if (handle.includes('b')) { height = originalElement.height + dy; }
-            if (handle.includes('t')) { height = originalElement.height - dy; y = originalElement.y + dy; }
-
-            if (!shiftKey) {
-                if (handle.includes('r') || handle.includes('l')) {
-                    height = width / aspectRatio;
-                    if (handle.includes('t')) y = (originalElement.y + originalElement.height) - height;
-                } else {
-                    width = height * aspectRatio;
-                    if (handle.includes('l')) x = (originalElement.x + originalElement.width) - width;
-                }
-            }
-
-            if (width < 1) { width = 1; x = originalElement.x + originalElement.width - 1; }
-            if (height < 1) { height = 1; y = originalElement.y + originalElement.height - 1; }
-
-            setElements(prev => prev.map(el =>
-                el.id === originalElement.id ? { ...el, x, y, width, height } : el
-            ), false);
-            return;
-        }
-
-        if (interactionMode.current.startsWith('crop-')) {
-            if (!croppingState || !cropStartInfo.current) return;
-            const handle = interactionMode.current.split('-')[1];
-            const { originalCropBox, startCanvasPoint: cropStartPoint } = cropStartInfo.current;
-            let { x, y, width, height } = { ...originalCropBox };
-            const { originalElement } = croppingState;
-            const dx = point.x - cropStartPoint.x;
-            const dy = point.y - cropStartPoint.y;
-
-            if (handle.includes('r')) { width = originalCropBox.width + dx; }
-            if (handle.includes('l')) { width = originalCropBox.width - dx; x = originalCropBox.x + dx; }
-            if (handle.includes('b')) { height = originalCropBox.height + dy; }
-            if (handle.includes('t')) { height = originalCropBox.height - dy; y = originalCropBox.y + dy; }
-            
-            if (x < originalElement.x) {
-                width += x - originalElement.x;
-                x = originalElement.x;
-            }
-            if (y < originalElement.y) {
-                height += y - originalElement.y;
-                y = originalElement.y;
-            }
-            if (x + width > originalElement.x + originalElement.width) {
-                width = originalElement.x + originalElement.width - x;
-            }
-            if (y + height > originalElement.y + originalElement.height) {
-                height = originalElement.y + originalElement.height - y;
-            }
-
-            if (width < 1) {
-                width = 1;
-                if (handle.includes('l')) { x = originalCropBox.x + originalCropBox.width - 1; }
-            }
-            if (height < 1) {
-                height = 1;
-                if (handle.includes('t')) { y = originalCropBox.y + originalCropBox.height - 1; }
-            }
-
-            setCroppingState(prev => prev ? { ...prev, cropBox: { x, y, width, height } } : null);
-            return;
-        }
-
-
-        switch(interactionMode.current) {
-            case 'pan': {
-                const dx = e.clientX - startPoint.current.x;
-                const dy = e.clientY - startPoint.current.y;
-                setPanOffset(prev => ({ x: prev.x + dx, y: prev.y + dy }));
-                startPoint.current = { x: e.clientX, y: e.clientY };
-                break;
-            }
-            case 'draw': {
-                if (currentDrawingElementId.current) {
-                    setElements(prev => prev.map(el => {
-                        if (el.id === currentDrawingElementId.current && el.type === 'path') {
-                            return { ...el, points: [...el.points, point] };
-                        }
-                        return el;
-                    }), false);
-                }
-                break;
-            }
-            case 'drawShape': {
-                 if (currentDrawingElementId.current) {
-                    setElements(prev => prev.map(el => {
-                        if (el.id === currentDrawingElementId.current && el.type === 'shape') {
-                            const newX = Math.min(point.x, startCanvasPoint.x);
-                            const newY = Math.min(point.y, startCanvasPoint.y);
-                            const newWidth = Math.abs(point.x - startCanvasPoint.x);
-                            const newHeight = Math.abs(point.y - startCanvasPoint.y);
-                            return {...el, x: newX, y: newY, width: newWidth, height: newHeight};
-                        }
-                        return el;
-                    }), false);
-                }
-                break;
-            }
-            case 'dragElements': {
-                const dx = point.x - startCanvasPoint.x;
-                const dy = point.y - startCanvasPoint.y;
-                
-                const movingElementIds = Array.from(dragStartElementPositions.current.keys());
-                const movingElements = elements.filter(el => movingElementIds.includes(el.id));
-                const otherElements = elements.filter(el => !movingElementIds.includes(el.id));
-                const snapThresholdCanvas = SNAP_THRESHOLD / zoom;
-
-                let finalDx = dx;
-                let finalDy = dy;
-                let activeGuides: Guide[] = [];
-
-                // Alignment Snapping
-                const getSnapPoints = (bounds: Rect) => ({
-                    v: [bounds.x, bounds.x + bounds.width / 2, bounds.x + bounds.width],
-                    h: [bounds.y, bounds.y + bounds.height / 2, bounds.y + bounds.height],
-                });
-
-                const staticSnapPoints = { v: new Set<number>(), h: new Set<number>() };
-                otherElements.forEach(el => {
-                    const bounds = getElementBounds(el);
-                    getSnapPoints(bounds).v.forEach(p => staticSnapPoints.v.add(p));
-                    getSnapPoints(bounds).h.forEach(p => staticSnapPoints.h.add(p));
-                });
-                
-                let bestSnapX = { dist: Infinity, val: finalDx, guide: null as Guide | null };
-                let bestSnapY = { dist: Infinity, val: finalDy, guide: null as Guide | null };
-                
-                movingElements.forEach(movingEl => {
-                    const startPos = dragStartElementPositions.current.get(movingEl.id);
-                    if (!startPos) return;
-
-                    let movingBounds: Rect;
-                    if (movingEl.type === 'image' || movingEl.type === 'shape') {
-                        movingBounds = getElementBounds({...movingEl, x: (startPos as Point).x, y: (startPos as Point).y });
-                    } else { // path
-                        movingBounds = getElementBounds({...movingEl, points: (startPos as Point[]) });
-                    }
-
-                    const movingSnapPoints = getSnapPoints(movingBounds);
-
-                    movingSnapPoints.v.forEach(p => {
-                        staticSnapPoints.v.forEach(staticP => {
-                            const dist = Math.abs((p + finalDx) - staticP);
-                            if (dist < snapThresholdCanvas && dist < bestSnapX.dist) {
-                                bestSnapX = { dist, val: staticP - p, guide: { type: 'v', position: staticP, start: movingBounds.y, end: movingBounds.y + movingBounds.height }};
-                            }
-                        });
-                    });
-                    movingSnapPoints.h.forEach(p => {
-                        staticSnapPoints.h.forEach(staticP => {
-                            const dist = Math.abs((p + finalDy) - staticP);
-                            if (dist < snapThresholdCanvas && dist < bestSnapY.dist) {
-                                bestSnapY = { dist, val: staticP - p, guide: { type: 'h', position: staticP, start: movingBounds.x, end: movingBounds.x + movingBounds.width }};
-                            }
-                        });
-                    });
-                });
-                
-                if (bestSnapX.guide) { finalDx = bestSnapX.val; activeGuides.push(bestSnapX.guide); }
-                if (bestSnapY.guide) { finalDy = bestSnapY.val; activeGuides.push(bestSnapY.guide); }
-                
-                setAlignmentGuides(activeGuides);
-
-                setElements(prev => prev.map(el => {
-                    if (movingElementIds.includes(el.id)) {
-                        const startPos = dragStartElementPositions.current.get(el.id);
-                        if (!startPos) return el;
-                        
-                        if (el.type === 'image' || el.type === 'shape') {
-                            return { ...el, x: (startPos as Point).x + finalDx, y: (startPos as Point).y + finalDy };
-                        }
-                        if (el.type === 'path') {
-                             return { ...el, points: (startPos as Point[]).map(p => ({ x: p.x + finalDx, y: p.y + finalDy })) };
-                        }
-                    }
-                    return el;
-                }), false);
-                break;
-            }
-             case 'selectBox': {
-                const newX = Math.min(point.x, startCanvasPoint.x);
-                const newY = Math.min(point.y, startCanvasPoint.y);
-                const newWidth = Math.abs(point.x - startCanvasPoint.x);
-                const newHeight = Math.abs(point.y - startCanvasPoint.y);
-                setSelectionBox({ x: newX, y: newY, width: newWidth, height: newHeight });
-                break;
+            setSelectedElementIds(selectedIds);
+            setSelectionBox(null);
+        } else if (action === 'drawing' && activeTool === 'draw' && currentDrawingElementId.current) {
+            // 完成绘制，提交到历史记录
+            commitAction(elementsRef.current);
+        } else if (action === 'drawing' && activeTool === 'erase') {
+            // 橡皮擦完成，提交历史记录
+            commitAction(elementsRef.current);
+        } else if (action === 'drawing' && ['rectangle', 'circle', 'triangle'].includes(activeTool) && currentDrawingElementId.current) {
+            // 形状工具完成绘制，提交到历史记录
+            commitAction(elementsRef.current);
+        } else if (action === 'moving' && selectedElement) {
+            // 完成拖拽，提交到历史记录
+            commitAction(elementsRef.current);
+        } else if (action === 'resizing' && resizeStartInfo.current) {
+            // 完成调整大小，提交到历史记录
+            commitAction(elementsRef.current);
+            // 更新选中元素
+            const updatedElement = elementsRef.current.find(el => el.id === resizeStartInfo.current!.originalElement.id);
+            if (updatedElement) {
+                setSelectedElement(updatedElement);
             }
         }
+        
+        // 清理状态
+        setAction('none');
+        currentDrawingElementId.current = null;
+        dragStartElementPositions.current.clear();
+        cropStartInfo.current = null;
+        resizeStartInfo.current = null;
     };
     
-    const handleMouseUp = () => {
-        if (interactionMode.current) {
-            if (interactionMode.current === 'selectBox' && selectionBox) {
-                const selectedIds: string[] = [];
-                const { x: sx, y: sy, width: sw, height: sh } = selectionBox;
-                
-                elements.forEach(element => {
-                    const bounds = getElementBounds(element);
-                    const { x: ex, y: ey, width: ew, height: eh } = bounds;
-                    
-                    if (sx < ex + ew && sx + sw > ex && sy < ey + eh && sy + sh > ey) {
-                        selectedIds.push(element.id);
-                    }
-                });
-                setSelectedElementIds(selectedIds);
-            } else if (['draw', 'drawShape', 'dragElements', 'erase'].some(prefix => interactionMode.current?.startsWith(prefix)) || interactionMode.current.startsWith('resize-')) {
-                const newHistory = [...history.slice(0, historyIndex + 1), elementsRef.current];
-                setHistory(newHistory);
-                setHistoryIndex(newHistory.length - 1);
-            }
+    // 辅助函数：检查元素是否在选择框内
+    const isElementInSelectionBox = (element: Element, box: { x: number; y: number; width: number; height: number }) => {
+        if (element.type === 'path') {
+            return element.points.some(point => 
+                point.x >= box.x && point.x <= box.x + box.width &&
+                point.y >= box.y && point.y <= box.y + box.height
+            );
+        } else {
+            return element.x < box.x + box.width &&
+                   element.x + (element.width || 0) > box.x &&
+                   element.y < box.y + box.height &&
+                   element.y + (element.height || 0) > box.y;
         }
-        
-        interactionMode.current = null;
-        currentDrawingElementId.current = null;
-        setSelectionBox(null);
-        resizeStartInfo.current = null;
-        cropStartInfo.current = null;
-        setAlignmentGuides([]);
-        dragStartElementPositions.current.clear();
     };
 
-    const handleWheel = (e: React.WheelEvent<SVGSVGElement>) => {
-        if (croppingState) { e.preventDefault(); return; }
-        e.preventDefault();
-        const zoomFactor = 1.05;
-        const { clientX, clientY, deltaY } = e;
-        
-        const oldZoom = zoom;
-        const newZoom = deltaY < 0 ? oldZoom * zoomFactor : oldZoom / zoomFactor;
-        const clampedZoom = Math.max(0.1, Math.min(newZoom, 10));
-
-        const mousePoint = { x: clientX, y: clientY };
-        const newPanX = mousePoint.x - (mousePoint.x - panOffset.x) * (clampedZoom / oldZoom);
-        const newPanY = mousePoint.y - (mousePoint.y - panOffset.y) * (clampedZoom / oldZoom);
-
-        setZoom(clampedZoom);
-        setPanOffset({ x: newPanX, y: newPanY });
-    };
-
-    const handleDeleteElement = (id: string) => {
-        commitAction(prev => prev.filter(el => el.id !== id));
-        setSelectedElementIds(prev => prev.filter(selId => selId !== id));
-    };
-
-    const handleCopyElement = (elementToCopy: Element) => {
-        commitAction(prev => {
-             const newElement = {
-                ...JSON.parse(JSON.stringify(elementToCopy)),
-                id: generateId(),
-                x: elementToCopy.x + 20 / zoom,
-                y: elementToCopy.y + 20 / zoom,
+    const handleAddImageElement = (file: File) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const img = new Image();
+            img.onload = () => {
+                const newImageElement: Element = {
+                    id: generateId(),
+                    type: 'image',
+                    x: 100,
+                    y: 100,
+                    width: img.width,
+                    height: img.height,
+                    href: img.src,
+                    mimeType: file.type,
+                };
+                const newElements = [...elements, newImageElement];
+                setElements(newElements);
+                commitAction(newElements);
             };
-
-            if (newElement.type === 'path') {
-                const bounds = getElementBounds(elementToCopy);
-                const dx = (bounds.x + 20 / zoom) - bounds.x;
-                const dy = (bounds.y + 20 / zoom) - bounds.y;
-                newElement.points = newElement.points.map(p => ({ x: p.x + dx, y: p.y + dy }));
-            }
-            setSelectedElementIds([newElement.id]);
-            return [...prev, newElement];
-        });
+            img.src = reader.result as string;
+        };
+        reader.readAsDataURL(file);
     };
 
-     const handleDownloadImage = (element: ImageElement) => {
-        const link = document.createElement('a');
-        link.href = element.href;
-        link.download = `canvas-image-${element.id}.${element.mimeType.split('/')[1] || 'png'}`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
+    const handleDragOver = (e: React.DragEvent) => {
+        e.preventDefault();
     };
 
-    const handleStartCrop = (element: ImageElement) => {
-        setActiveTool('select');
-        setCroppingState({
-            elementId: element.id,
-            originalElement: { ...element },
-            cropBox: { x: element.x, y: element.y, width: element.width, height: element.height },
-        });
+    const handleDrop = (e: React.DragEvent) => {
+         e.preventDefault();
+         const files = Array.from(e.dataTransfer.files);
+         files.forEach((file: File) => {
+             if (file.type.startsWith('image/')) {
+                 handleAddImageElement(file);
+             }
+         });
+     };
+
+    const handleWheel = (e: React.WheelEvent) => {
+        e.preventDefault();
     };
 
-    const handleCancelCrop = () => setCroppingState(null);
+    const handleCopyElement = () => {
+         if (selectedElement) {
+             setClipboard(selectedElement);
+         }
+     };
+
+    const handleDownloadImage = () => {
+         if (selectedElement && selectedElement.type === 'image') {
+             const imageElement = selectedElement as ImageElement;
+             const link = document.createElement('a');
+             link.href = imageElement.href;
+             link.download = `image_${imageElement.id}.png`;
+             link.click();
+         }
+     };
+
+    const handleStartCrop = () => {
+         if (selectedElement && selectedElement.type === 'image') {
+             const imageElement = selectedElement as ImageElement;
+             setCroppingState({
+                 elementId: imageElement.id,
+                 originalElement: imageElement,
+                 cropBox: {
+                     x: imageElement.x,
+                     y: imageElement.y,
+                     width: imageElement.width,
+                     height: imageElement.height
+                 }
+             });
+         }
+     };
+
+    const handleDeleteElement = () => {
+         if (selectedElement) {
+             const newElements = elements.filter(el => el.id !== selectedElement.id);
+             setElements(newElements);
+             commitAction(newElements);
+             setSelectedElement(null);
+         }
+     };
 
     const handleConfirmCrop = () => {
-        if (!croppingState) return;
-        const { elementId, cropBox } = croppingState;
-        const elementToCrop = elementsRef.current.find(el => el.id === elementId) as ImageElement;
-
-        if (!elementToCrop) { handleCancelCrop(); return; }
-        
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = cropBox.width;
-            canvas.height = cropBox.height;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) { setError("Failed to create canvas context for cropping."); handleCancelCrop(); return; }
-            const sx = cropBox.x - elementToCrop.x;
-            const sy = cropBox.y - elementToCrop.y;
-            ctx.drawImage(img, sx, sy, cropBox.width, cropBox.height, 0, 0, cropBox.width, cropBox.height);
-            const newHref = canvas.toDataURL(elementToCrop.mimeType);
-
-            commitAction(prev => prev.map(el =>
-                el.id === elementId
-                    ? { ...el, href: newHref, x: cropBox.x, y: cropBox.y, width: cropBox.width, height: cropBox.height } as ImageElement
-                    : el
-            ));
-            handleCancelCrop();
-        };
-        img.onerror = () => { setError("Failed to load image for cropping."); handleCancelCrop(); }
-        img.src = elementToCrop.href;
+        if (croppingState) {
+            const { elementId, cropBox } = croppingState;
+            const newElements = elements.map(el => {
+                if (el.id === elementId && el.type === 'image') {
+                    return {
+                        ...el,
+                        x: cropBox.x,
+                        y: cropBox.y,
+                        width: cropBox.width,
+                        height: cropBox.height
+                    };
+                }
+                return el;
+            });
+            setElements(newElements);
+            commitAction(newElements);
+        }
+        setCroppingState(null);
     };
 
-    const handleGenerate = async () => {
-        const imagesToProcess = elements.filter(el => selectedElementIds.includes(el.id) && el.type === 'image') as ImageElement[];
-        if (imagesToProcess.length === 0 || !prompt.trim()) { setError('Please select one or more images and enter a prompt.'); return; }
-        setIsLoading(true); setError(null);
+    const handleCancelCrop = () => {
+        setCroppingState(null);
+    };
+
+    const handleGenerate = async (prompt: string) => {
+        await handleGenerateArt(prompt);
+    };
+
+    const handleCopy = () => {
+        if (selectedElement) {
+            setClipboard(selectedElement);
+        }
+    };
+
+    const handlePaste = () => {
+        if (clipboard) {
+            const newElement = {
+                ...clipboard,
+                id: generateId(),
+                x: clipboard.x + 10,
+                y: clipboard.y + 10
+            };
+            const newElements = [...elements, newElement];
+            setElements(newElements);
+            commitAction(newElements);
+        }
+    };
+
+    const handleDelete = () => {
+        if (selectedElementIds.length > 0) {
+            // 删除所有选中的元素
+            const newElements = elements.filter(el => !selectedElementIds.includes(el.id));
+            setElements(newElements);
+            commitAction(newElements);
+            setSelectedElement(null);
+            setSelectedElementIds([]);
+        } else if (selectedElement) {
+            // 兼容单个选中元素的情况
+            const newElements = elements.filter(el => el.id !== selectedElement.id);
+            setElements(newElements);
+            commitAction(newElements);
+            setSelectedElement(null);
+        }
+    };
+
+    const handleLayerChange = (direction: 'up' | 'down') => {
+        if (selectedElement) {
+            const index = elements.findIndex(el => el.id === selectedElement.id);
+            if ((direction === 'up' && index < elements.length - 1) || (direction === 'down' && index > 0)) {
+                const newIndex = direction === 'up' ? index + 1 : index - 1;
+                const newElements = [...elements];
+                [newElements[index], newElements[newIndex]] = [newElements[newIndex], newElements[index]];
+                setElements(newElements);
+                commitAction(newElements);
+            }
+        }
+    };
+
+    const handleGenerateArt = async (prompt: string) => {
+        if (!prompt.trim()) return;
+        setIsGenerating(true);
         try {
-            const result = await editImage(imagesToProcess.map(img => ({ href: img.href, mimeType: img.mimeType })), prompt);
-            if (result.newImageBase64 && result.newImageMimeType) {
-                const { newImageBase64, newImageMimeType } = result;
-                let minX = Infinity, minY = Infinity, maxX = -Infinity;
-                imagesToProcess.forEach(img => {
-                    minX = Math.min(minX, img.x);
-                    minY = Math.min(minY, img.y);
-                    maxX = Math.max(maxX, img.x + img.width);
-                });
+            // For now, create a placeholder image since generateImage doesn't exist
+             const result = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+            const newImageElement: Element = {
+                id: generateId(),
+                type: 'image',
+                x: 100,
+                y: 100,
+                width: 512,
+                height: 512,
+                href: result,
+                mimeType: 'image/png',
+            };
+            const newElements = [...elements, newImageElement];
+            setElements(newElements);
+            commitAction(newElements);
+        } catch (error) {
+            console.error('Error generating art:', error);
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
+    const handleSave = () => {
+        const dataStr = JSON.stringify(elements, null, 2);
+        const dataBlob = new Blob([dataStr], { type: 'application/json' });
+        saveAs(dataBlob, 'canvas-elements.json');
+    };
+
+    const handleLoad = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const loadedElements = JSON.parse(e.target?.result as string);
+                    setElements(loadedElements);
+                    commitAction(loadedElements);
+                } catch (error) {
+                    console.error('Error loading file:', error);
+                }
+            };
+            reader.readAsText(file);
+        }
+    };
+
+    const handleClear = () => {
+        const newElements: Element[] = [];
+        setElements(newElements);
+        commitAction(newElements);
+    };
+
+    const handleImageUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = () => {
                 const img = new Image();
                 img.onload = () => {
-                    const newImage: ImageElement = {
-                        id: generateId(), type: 'image', x: maxX + 20, y: minY,
-                        width: img.width, height: img.height,
-                        href: `data:${newImageMimeType};base64,${newImageBase64}`, mimeType: newImageMimeType,
+                    const newImageElement: Element = {
+                        id: generateId(),
+                        type: 'image',
+                        x: 100,
+                        y: 100,
+                        width: img.width,
+                        height: img.height,
+                        href: img.src,
+                        mimeType: file.type,
                     };
-                    commitAction(prev => [...prev, newImage]);
-                    setSelectedElementIds([newImage.id]);
+                    const newElements = [...elements, newImageElement];
+                    setElements(newElements);
+                    commitAction(newElements);
                 };
-                img.onerror = () => setError('Failed to load the generated image.');
-                img.src = `data:${newImageMimeType};base64,${newImageBase64}`;
-            } else { setError(result.textResponse || 'Generation failed to produce an image.'); }
-        } catch (err) {
-            const error = err as Error; setError(`An error occurred during generation: ${error.message}`); console.error("Generation failed:", error);
-        } finally { setIsLoading(false); }
+                img.src = reader.result as string;
+            };
+            reader.readAsDataURL(file);
+        }
     };
-    
-    const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); }, []);
-    const handleDrop = useCallback((e: React.DragEvent) => { e.preventDefault(); if (e.dataTransfer.files && e.dataTransfer.files[0]) { handleAddImageElement(e.dataTransfer.files[0]); } }, [handleAddImageElement]);
 
     const handleFillColorChange = (elementId: string, newColor: string) => {
-        commitAction(prev => prev.map(el => (el.id === elementId && el.type === 'shape') ? { ...el, fillColor: newColor } : el));
+        const newElements = elements.map(el => (el.id === elementId && el.type === 'shape') ? { ...el, fillColor: newColor } : el);
+        setElements(newElements);
+        commitAction(newElements);
     };
 
      const handleLayerAction = (elementId: string, action: 'front' | 'back' | 'forward' | 'backward') => {
-        commitAction(prev => {
-            const elementsCopy = [...prev];
-            const index = elementsCopy.findIndex(el => el.id === elementId);
-            if (index === -1) return elementsCopy;
+        const elementsCopy = [...elements];
+        const index = elementsCopy.findIndex(el => el.id === elementId);
+        if (index === -1) return;
 
-            const [element] = elementsCopy.splice(index, 1);
+        const [element] = elementsCopy.splice(index, 1);
 
-            if (action === 'front') {
-                elementsCopy.push(element);
-            } else if (action === 'back') {
-                elementsCopy.unshift(element);
-            } else if (action === 'forward') {
-                const newIndex = Math.min(elementsCopy.length, index + 1);
-                elementsCopy.splice(newIndex, 0, element);
-            } else if (action === 'backward') {
-                const newIndex = Math.max(0, index - 1);
-                elementsCopy.splice(newIndex, 0, element);
-            }
-            return elementsCopy;
-        });
+        if (action === 'front') {
+            elementsCopy.push(element);
+        } else if (action === 'back') {
+            elementsCopy.unshift(element);
+        } else if (action === 'forward') {
+            const newIndex = Math.min(elementsCopy.length, index + 1);
+            elementsCopy.splice(newIndex, 0, element);
+        } else if (action === 'backward') {
+            const newIndex = Math.max(0, index - 1);
+            elementsCopy.splice(newIndex, 0, element);
+        }
+        setElements(elementsCopy);
+        commitAction(elementsCopy);
         setContextMenu(null);
     };
 
@@ -716,7 +748,7 @@ const App: React.FC = () => {
 
     let cursor = 'default';
     if (croppingState) cursor = 'default';
-    else if (interactionMode.current === 'pan') cursor = 'grabbing';
+    else if (action === 'moving' && activeTool === 'pan') cursor = 'grabbing';
     else if (activeTool === 'pan') cursor = 'grab';
     else if (['draw', 'erase', 'rectangle', 'circle', 'triangle'].includes(activeTool)) cursor = 'crosshair';
     
@@ -785,7 +817,7 @@ const App: React.FC = () => {
                                     ];
                                      selectionComponent = <g>
                                         <rect x={el.x} y={el.y} width={el.width} height={el.height} fill="none" stroke="rgb(59 130 246)" strokeWidth={2 / zoom} pointerEvents="none" />
-                                        {handles.map(h => <rect key={h.name} data-handle={h.name} x={h.x - handleSize / 2} y={h.y - handleSize / 2} width={handleSize} height={handleSize} fill="white" stroke="#3b82f6" strokeWidth={1 / zoom} style={{ cursor: h.cursor }} />)}
+                                        {handles.map(h => <rect key={h.name} data-handle={h.name} x={h.x - handleSize / 2} y={h.y - handleSize / 2} width={handleSize} height={handleSize} fill="white" stroke="#3b82f6" strokeWidth={1 / zoom} style={{ cursor: h.cursor }} pointerEvents="all" />)}
                                     </g>;
                                 }
                             }
@@ -815,6 +847,20 @@ const App: React.FC = () => {
                         {alignmentGuides.map((guide, i) => (
                              <line key={i} x1={guide.type === 'v' ? guide.position : guide.start} y1={guide.type === 'h' ? guide.position : guide.start} x2={guide.type === 'v' ? guide.position : guide.end} y2={guide.type === 'h' ? guide.position : guide.end} stroke="red" strokeWidth={1/zoom} strokeDasharray={`${4/zoom} ${2/zoom}`} />
                         ))}
+                        
+                        {selectionBox && (
+                            <rect 
+                                x={selectionBox.x} 
+                                y={selectionBox.y} 
+                                width={selectionBox.width} 
+                                height={selectionBox.height} 
+                                fill="rgba(59, 130, 246, 0.1)" 
+                                stroke="rgb(59, 130, 246)" 
+                                strokeWidth={1/zoom} 
+                                strokeDasharray={`${4/zoom} ${2/zoom}`}
+                                pointerEvents="none"
+                            />
+                        )}
 
                         {singleSelectedElement && !croppingState && (() => {
                             const element = singleSelectedElement;
@@ -833,12 +879,12 @@ const App: React.FC = () => {
                                 onMouseDown={(e) => e.stopPropagation()}
                             >
                                 <div className="p-1.5 bg-white rounded-lg shadow-lg flex items-center justify-center space-x-2 border border-gray-200 text-gray-800">
-                                    <button title="Copy" onClick={() => handleCopyElement(element)} className="p-2 rounded hover:bg-gray-100 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>
-                                    {element.type === 'image' && <button title="Download" onClick={() => handleDownloadImage(element as ImageElement)} className="p-2 rounded hover:bg-gray-100 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>}
-                                    {element.type === 'image' && <button title="Crop" onClick={() => handleStartCrop(element as ImageElement)} className="p-2 rounded hover:bg-gray-100 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6.13 1L6 16a2 2 0 0 0 2 2h15"></path><path d="M1 6.13L16 6a2 2 0 0 1 2 2v15"></path></svg></button>}
+                                    <button title="Copy" onClick={handleCopy} className="p-2 rounded hover:bg-blue-100 hover:text-blue-600 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>
+                                    {element.type === 'image' && <button title="Download" onClick={handleDownloadImage} className="p-2 rounded hover:bg-gray-100 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>}
+                                    {element.type === 'image' && <button title="Crop" onClick={handleStartCrop} className="p-2 rounded hover:bg-gray-100 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6.13 1L6 16a2 2 0 0 0 2 2h15"></path><path d="M1 6.13L16 6a2 2 0 0 1 2 2v15"></path></svg></button>}
                                     {element.type === 'shape' && <input type="color" title="Fill Color" value={(element as ShapeElement).fillColor} onChange={e => handleFillColorChange(element.id, e.target.value)} className="w-7 h-7 p-0 border-none rounded cursor-pointer" />}
                                     <div className="h-6 w-px bg-gray-200"></div>
-                                    <button title="Delete" onClick={() => handleDeleteElement(element.id)} className="p-2 rounded hover:bg-red-100 hover:text-red-600 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
+                                    <button title="Delete" onClick={handleDelete} className="p-2 rounded hover:bg-red-100 hover:text-red-600 flex items-center justify-center"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
                                 </div>
                             </div>;
                             

@@ -6,8 +6,8 @@ import type { JSX } from 'react';
 interface ToolbarProps {
     activeTool: Tool;
     setActiveTool: (tool: Tool) => void;
-    drawingOptions: { strokeColor: string; strokeWidth: number };
-    setDrawingOptions: (options: { strokeColor: string; strokeWidth: number }) => void;
+    drawingOptions: { strokeColor: string; strokeWidth: number; fillColor: string };
+    setDrawingOptions: (options: { strokeColor: string; strokeWidth: number; fillColor: string }) => void;
     onUpload: (file: File) => void;
     isCropping: boolean;
     onConfirmCrop: () => void;
@@ -190,6 +190,28 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             <input type="color" aria-label="Stroke Color" value={drawingOptions.strokeColor} onChange={(e) => setDrawingOptions({ ...drawingOptions, strokeColor: e.target.value })} className="w-8 h-8 p-0 border-none rounded-md cursor-pointer bg-white" />
             <input type="range" min="1" max="50" value={drawingOptions.strokeWidth} aria-label="Stroke Width" onChange={(e) => setDrawingOptions({ ...drawingOptions, strokeWidth: parseInt(e.target.value, 10) })} className="w-24 cursor-pointer" />
             <span className="text-sm text-gray-600 w-6 text-center">{drawingOptions.strokeWidth}</span>
+            <div className="flex items-center space-x-1">
+                <button
+                    onClick={() => setDrawingOptions({ ...drawingOptions, fillColor: 'none' })}
+                    className={`w-8 h-8 border-2 rounded-md cursor-pointer flex items-center justify-center ${
+                        drawingOptions.fillColor === 'none' ? 'border-blue-500 bg-blue-50' : 'border-gray-300 bg-white'
+                    }`}
+                    title="Transparent Fill"
+                >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" fill="none"/>
+                    </svg>
+                </button>
+                <input
+                    type="color"
+                    aria-label="Fill Color"
+                    value={drawingOptions.fillColor === 'none' ? '#ffffff' : drawingOptions.fillColor}
+                    onChange={(e) => setDrawingOptions({ ...drawingOptions, fillColor: e.target.value })}
+                    className="w-8 h-8 p-0 border-none rounded-md cursor-pointer bg-white"
+                    title="Fill Color"
+                />
+            </div>
             <div className="h-8 w-px bg-gray-200 mx-2"></div>
             <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="image/*" className="hidden" />
             <ToolButton label="Upload Image" onClick={handleUploadClick} shortcut={SHORTCUTS.upload} icon={<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>} />
